@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import cv2
 import numpy as np
 import gtsam
+from src.orb_extractor import ORBExtractor
 from src.frame import Frame
 from src.feature_matcher import search_for_initialization
 from src.two_view_reconstruction import TwoViewReconstruction
@@ -126,12 +127,14 @@ def main():
     with open(TIMESTAMPS) as f:
         lines = [l.strip() for l in f if l.strip()]
 
-    extractor   = cv2.ORB_create(nfeatures=1000, scaleFactor=1.2, nlevels=8)
+    # ORB-SLAM3 uses 5*nFeatures for initialization extractor
+    extractor   = ORBExtractor(n_features=5000, scale_factor=1.2, n_levels=8,
+                               ini_th_fast=20, min_th_fast=7)
     reconstruct = TwoViewReconstruction(K, sigma=1.0)
 
     # --- Reference frame (frame 0) ---
     img0 = cv2.imread(os.path.join(DATA_DIR, lines[0]+'.png'), cv2.IMREAD_GRAYSCALE)
-    kps0, desc0 = extractor.detectAndCompute(img0, None)
+    kps0, desc0 = extractor.detect_and_compute(img0)
     frame_ref   = Frame(img0, kps0, desc0, K, DIST, frame_id=0)
     prev_matched = [kp.pt for kp in frame_ref.keypoints]
 
@@ -146,7 +149,7 @@ def main():
         if img is None:
             continue
 
-        kps, desc = extractor.detectAndCompute(img, None)
+        kps, desc = extractor.detect_and_compute(img)
         if len(kps) < MIN_FEATURES:
             continue
 

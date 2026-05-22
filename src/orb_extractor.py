@@ -18,6 +18,24 @@ PATCH_SIZE = 31
 HALF_PATCH_SIZE = 15
 CELL_SIZE = 35
 
+# Precompute umax table for IC_Angle (ORB-SLAM3 style)
+def _build_umax():
+    umax = [0] * (HALF_PATCH_SIZE + 1)
+    vmax = int(np.floor(HALF_PATCH_SIZE * np.sqrt(2) / 2 + 1))
+    vmin = int(np.ceil(HALF_PATCH_SIZE * np.sqrt(2) / 2))
+    hp2 = HALF_PATCH_SIZE * HALF_PATCH_SIZE
+    for v in range(vmax + 1):
+        umax[v] = int(round(np.sqrt(hp2 - v * v)))
+    v0 = 0
+    for v in range(HALF_PATCH_SIZE, vmin - 1, -1):
+        while umax[v0] == umax[v0 + 1]:
+            v0 += 1
+        umax[v] = v0
+        v0 += 1
+    return umax
+
+_UMAX = _build_umax()
+
 
 class ORBExtractor:
     def __init__(self, n_features=1000, scale_factor=1.2, n_levels=8,
@@ -97,14 +115,15 @@ class ORBExtractor:
     def _detect_fast(self, img, level):
         """Detect FAST keypoints in 35x35 cells, then distribute via OctTree.
         img is the padded image (EDGE_THRESHOLD border on all sides).
+        Actual image starts at (EDGE_THRESHOLD, EDGE_THRESHOLD) in padded coords.
+        Detection region = actual image inset by (EDGE_THRESHOLD-3) on each side.
+        → In padded coords: [2*EDGE_THRESHOLD-3, w-2*EDGE_THRESHOLD+3]
         """
         h, w = img.shape
-        # The actual image starts at (EDGE_THRESHOLD, EDGE_THRESHOLD) inside padded img
-        # Detection region excludes 3px from the inner border
-        min_x = EDGE_THRESHOLD - 3
-        min_y = EDGE_THRESHOLD - 3
-        max_x = w - EDGE_THRESHOLD + 3
-        max_y = h - EDGE_THRESHOLD + 3
+        min_x = 2 * EDGE_THRESHOLD - 3   # = 35
+        min_y = 2 * EDGE_THRESHOLD - 3
+        max_x = w - 2 * EDGE_THRESHOLD + 3
+        max_y = h - 2 * EDGE_THRESHOLD + 3
 
         n_cols = max(1, round((max_x - min_x) / CELL_SIZE))
         n_rows = max(1, round((max_y - min_y) / CELL_SIZE))
@@ -147,6 +166,9 @@ class ORBExtractor:
             candidates, min_x, max_x, min_y, max_y, n_target
         )
 
+        # Compute IC_Angle orientation (in padded image coords)
+        self._compute_orientation(img, distributed)
+
         # Remove border offset, then scale back to level-0 space
         scale = self.scale_factors[level]
         for kp in distributed:
@@ -155,6 +177,34 @@ class ORBExtractor:
             kp.pt = (x, y)
 
         return distributed
+
+    def _compute_orientation(self, image, keypoints):
+        """Compute IC_Angle for each keypoint (ORB-SLAM3: computeOrientation)."""
+        for kp in keypoints:
+            cx = int(round(kp.pt[0]))
+            cy = int(round(kp.pt[1]))
+            h, w = image.shape
+
+            if (cx - HALF_PATCH_SIZE < 0 or cx + HALF_PATCH_SIZE >= w or
+                    cy - HALF_PATCH_SIZE < 0 or cy + HALF_PATCH_SIZE >= h):
+                kp.angle = 0.0
+                continue
+
+            # Center row (v=0)
+            row0 = image[cy, cx - HALF_PATCH_SIZE: cx + HALF_PATCH_SIZE + 1].astype(np.int32)
+            us = np.arange(-HALF_PATCH_SIZE, HALF_PATCH_SIZE + 1)
+            m10 = int(np.dot(us, row0))
+            m01 = 0
+
+            for v in range(1, HALF_PATCH_SIZE + 1):
+                d = _UMAX[v]
+                row_p = image[cy + v, cx - d: cx + d + 1].astype(np.int32)
+                row_m = image[cy - v, cx - d: cx + d + 1].astype(np.int32)
+                us_v = np.arange(-d, d + 1)
+                m01 += v * int(np.sum(row_p - row_m))
+                m10 += int(np.dot(us_v, row_p + row_m))
+
+            kp.angle = float(np.degrees(np.arctan2(m01, m10)))
 
     def _distribute_oct_tree(self, keypoints, min_x, max_x, min_y, max_y, n_target):
         """
