@@ -74,19 +74,33 @@ class ORBExtractor:
         return keypoints, descriptors
 
     def _build_pyramid(self, image):
-        pyramid = [image]
-        for level in range(1, self.n_levels):
+        # ORB-SLAM3: resize only (no blur). blur happens later before descriptor computation.
+        # Also add EDGE_THRESHOLD border (REFLECT_101) so FAST can detect near edges.
+        pyramid = []
+        for level in range(self.n_levels):
             scale = self.inv_scale_factors[level]
             h = round(image.shape[0] * scale)
             w = round(image.shape[1] * scale)
-            resized = cv2.resize(image, (w, h), interpolation=cv2.INTER_LINEAR)
-            blurred = cv2.GaussianBlur(resized, (7, 7), 2)
-            pyramid.append(blurred)
+            if level == 0:
+                resized = image
+            else:
+                resized = cv2.resize(pyramid[level - 1],
+                                     (w, h), interpolation=cv2.INTER_LINEAR)
+            # Add border so FAST can detect corners near image edges
+            padded = cv2.copyMakeBorder(resized,
+                                        EDGE_THRESHOLD, EDGE_THRESHOLD,
+                                        EDGE_THRESHOLD, EDGE_THRESHOLD,
+                                        cv2.BORDER_REFLECT_101)
+            pyramid.append(padded)
         return pyramid
 
     def _detect_fast(self, img, level):
-        """Detect FAST keypoints in 35x35 cells, then distribute via OctTree."""
+        """Detect FAST keypoints in 35x35 cells, then distribute via OctTree.
+        img is the padded image (EDGE_THRESHOLD border on all sides).
+        """
         h, w = img.shape
+        # The actual image starts at (EDGE_THRESHOLD, EDGE_THRESHOLD) inside padded img
+        # Detection region excludes 3px from the inner border
         min_x = EDGE_THRESHOLD - 3
         min_y = EDGE_THRESHOLD - 3
         max_x = w - EDGE_THRESHOLD + 3
@@ -133,10 +147,12 @@ class ORBExtractor:
             candidates, min_x, max_x, min_y, max_y, n_target
         )
 
-        # Scale coordinates back to level-0 space
+        # Remove border offset, then scale back to level-0 space
         scale = self.scale_factors[level]
         for kp in distributed:
-            kp.pt = (kp.pt[0] * scale, kp.pt[1] * scale)
+            x = (kp.pt[0] - EDGE_THRESHOLD) * scale
+            y = (kp.pt[1] - EDGE_THRESHOLD) * scale
+            kp.pt = (x, y)
 
         return distributed
 
@@ -205,13 +221,13 @@ class ORBExtractor:
             if not kps_level:
                 continue
 
-            # Convert back to level coordinates for descriptor computation
+            # Convert level-0 coords → level coords, then add border offset
             scale = self.inv_scale_factors[level]
             kps_scaled = []
             for kp in kps_level:
                 kp2 = cv2.KeyPoint(
-                    x=float(kp.pt[0] * scale),
-                    y=float(kp.pt[1] * scale),
+                    x=float(kp.pt[0] * scale + EDGE_THRESHOLD),
+                    y=float(kp.pt[1] * scale + EDGE_THRESHOLD),
                     _size=float(kp.size * scale),
                     _angle=kp.angle,
                     _response=kp.response,
@@ -219,7 +235,10 @@ class ORBExtractor:
                 )
                 kps_scaled.append(kp2)
 
-            _, descs = self._orb.compute(pyramid[level], kps_scaled)
+            # ORB-SLAM3: apply Gaussian blur on a working copy before descriptor computation
+            working = cv2.GaussianBlur(pyramid[level], (7, 7), 2,
+                                       borderType=cv2.BORDER_REFLECT_101)
+            _, descs = self._orb.compute(working, kps_scaled)
             if descs is None or len(descs) == 0:
                 continue
 
