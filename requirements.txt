@@ -1,6 +1,0 @@
-opencv-python
-numpy
-scipy
-matplotlib
-pyyaml
-gtsam
