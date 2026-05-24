@@ -80,6 +80,33 @@ def main():
     print(f"  Shared : {len(common)}  /  C++={len(pts_cpp)}  Python={len(pts_py)}"
           f"  ({100*len(common)/max(len(pts_cpp),1):.1f}%)")
 
+    # descriptor comparison at exact same positions
+    section("Descriptor comparison at exact same keypoint positions")
+    # build (rounded_pos → index) maps
+    pos_to_idx_cpp = {tuple(np.round(kps_cpp[i, :2], 1).tolist()): i for i in range(len(kps_cpp))}
+    pos_to_idx_py  = {tuple(np.round(kps_py[i,  :2], 1).tolist()): i for i in range(len(kps_py))}
+    common_pos = set(pos_to_idx_cpp) & set(pos_to_idx_py)
+
+    if common_pos:
+        hamming_dists = []
+        identical = 0
+        for pos in common_pos:
+            d_cpp = desc_cpp[pos_to_idx_cpp[pos]]
+            d_py  = desc_py[pos_to_idx_py[pos]]
+            h = int(np.unpackbits(d_cpp ^ d_py).sum())
+            hamming_dists.append(h)
+            if h == 0:
+                identical += 1
+        hamming_dists = np.array(hamming_dists)
+        print(f"  Shared keypoints     : {len(common_pos)}")
+        print(f"  Identical descriptors: {identical}  ({100*identical/len(common_pos):.1f}%)")
+        print(f"  Hamming dist  mean={hamming_dists.mean():.2f}  "
+              f"std={hamming_dists.std():.2f}  "
+              f"max={hamming_dists.max()}  "
+              f"median={int(np.median(hamming_dists))}")
+    else:
+        print("  No shared keypoint positions found")
+
     # position stats
     section("Position stats")
     for name, kps in [("C++", kps_cpp), ("Python", kps_py)]:

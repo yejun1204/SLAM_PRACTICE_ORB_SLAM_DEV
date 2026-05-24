@@ -1,0 +1,17 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/usr/include/opencv4",
+                "/usr/include/opencv4/opencv",
+                "/home/yejun/ORB_SLAM3/include"
+            ],
+            "compilerPath": "/usr/bin/g++",
+            "cppStandard": "c++14",
+            "intelliSenseMode": "linux-gcc-x64"
+        }
+    ],
+    "version": 4
+}
