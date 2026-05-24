@@ -163,23 +163,28 @@ class ORBExtractor:
         return keypoints, descriptors
 
     def _build_pyramid(self, image):
-        # ORB-SLAM3: resize only (no blur). blur happens later before descriptor computation.
-        # Also add EDGE_THRESHOLD border (REFLECT_101) so FAST can detect near edges.
+        # ORB-SLAM3 ComputePyramid: resize from interior (border-free) of previous level.
+        # C++: mvImagePyramid[level] is a sub-rect (no border); resize reads only interior.
+        # Storing padded image and resizing from it would stretch border pixels into content.
+        interiors = []
         pyramid = []
         for level in range(self.n_levels):
             scale = self.inv_scale_factors[level]
             h = round(image.shape[0] * scale)
             w = round(image.shape[1] * scale)
             if level == 0:
-                resized = image
+                interior = image
+                border_type = cv2.BORDER_REFLECT_101
             else:
-                resized = cv2.resize(pyramid[level - 1],
-                                     (w, h), interpolation=cv2.INTER_LINEAR)
-            # Add border so FAST can detect corners near image edges
-            padded = cv2.copyMakeBorder(resized,
+                interior = cv2.resize(interiors[level - 1],
+                                      (w, h), interpolation=cv2.INTER_LINEAR)
+                # BORDER_ISOLATED: border computed from interior only (matches C++)
+                border_type = cv2.BORDER_REFLECT_101 | cv2.BORDER_ISOLATED
+            padded = cv2.copyMakeBorder(interior,
                                         EDGE_THRESHOLD, EDGE_THRESHOLD,
                                         EDGE_THRESHOLD, EDGE_THRESHOLD,
-                                        cv2.BORDER_REFLECT_101)
+                                        border_type)
+            interiors.append(interior)
             pyramid.append(padded)
         return pyramid
 
