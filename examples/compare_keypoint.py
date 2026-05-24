@@ -120,6 +120,38 @@ def print_top_angle_mismatches(label, kps_cpp, kps_py):
                   f"{rc:>9.3f}  {rp:>9.3f}  {rdiff:>9.3f}")
 
 
+def to_cv_keypoints(kps_arr):
+    return [cv2.KeyPoint(float(r[0]), float(r[1]), float(r[2]),
+                         float(r[3] % 360), float(r[4]), int(r[5]))
+            for r in kps_arr]
+
+
+def save_level_images(image_path, kps_cpp, kps_py, out_path):
+    img_bgr = cv2.cvtColor(cv2.imread(image_path, cv2.IMREAD_GRAYSCALE),
+                            cv2.COLOR_GRAY2BGR)
+    rows = []
+    for lvl in range(N_LEVELS):
+        c = kps_cpp[kps_cpp[:, 5] == lvl]
+        p = kps_py [kps_py[:,  5] == lvl]
+
+        vis_c = cv2.drawKeypoints(img_bgr, to_cv_keypoints(c), None,
+                                  color=(0, 0, 255),
+                                  flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+        vis_p = cv2.drawKeypoints(img_bgr, to_cv_keypoints(p), None,
+                                  color=(0, 255, 0),
+                                  flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+
+        row = np.hstack([vis_c, vis_p])
+        cv2.putText(row, f"L{lvl} C++ ({len(c)})",
+                    (5, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        cv2.putText(row, f"L{lvl} Python ({len(p)})",
+                    (img_bgr.shape[1] + 5, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        rows.append(row)
+
+    cv2.imwrite(out_path, np.vstack(rows))
+    print(f"  Saved: {out_path}  (Red=C++  Green=Python)")
+
+
 def main():
     print(f"Image : {IMAGE}")
 
@@ -135,6 +167,10 @@ def main():
 
     sep("Top-5 angle mismatches per octave")
     print_top_angle_mismatches("C++ vs Python", kps_cpp, kps_py)
+
+    sep("Saving visualization")
+    out_path = os.path.join(os.path.dirname(__file__), 'keypoint_per_level.png')
+    save_level_images(IMAGE, kps_cpp, kps_py, out_path)
 
 
 if __name__ == '__main__':
