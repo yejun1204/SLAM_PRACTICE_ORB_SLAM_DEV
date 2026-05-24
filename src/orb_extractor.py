@@ -133,12 +133,6 @@ class ORBExtractor:
             n_desired *= factor
         self.n_features_per_level.append(max(n_features - total, 0))
 
-        # cv2 ORB for descriptor computation (uses its own pattern)
-        self._orb = cv2.ORB_create(nfeatures=n_features * 2,
-                                   scaleFactor=scale_factor,
-                                   nlevels=n_levels,
-                                   edgeThreshold=EDGE_THRESHOLD,
-                                   patchSize=PATCH_SIZE)
 
     def detect_and_compute(self, image):
         """
