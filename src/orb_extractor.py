@@ -173,7 +173,7 @@ class ORBExtractor:
                 interior = cv2.resize(interiors[level - 1],
                                       (w, h), interpolation=cv2.INTER_LINEAR)
                 # BORDER_ISOLATED: border computed from interior only (matches C++)
-                border_type = cv2.BORDER_REFLECT_101 | cv2.BORDER_ISOLATED
+                border_type = cv2.BORDER_REFLECT_101
             padded = cv2.copyMakeBorder(interior,
                                         EDGE_THRESHOLD, EDGE_THRESHOLD,
                                         EDGE_THRESHOLD, EDGE_THRESHOLD,
