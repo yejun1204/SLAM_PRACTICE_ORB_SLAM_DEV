@@ -164,6 +164,17 @@ def main():
     print(f"  Matches          : {n_iso}  "
           f"({'== C++' if n_iso == n_cpp else f'diff {n_iso - n_cpp:+d} vs C++'})")
 
+    # ── Match pair comparison: C++ vs Python matcher (same C++ keypoints) ────
+    sep("Match pair comparison  (C++ kps, C++ matcher vs Python matcher)")
+    pairs_cpp = {(i, j) for i, j in enumerate(matches_cpp) if j >= 0}
+    pairs_iso = {(i, j) for i, j in enumerate(matches_iso) if j >= 0}
+    identical  = pairs_cpp & pairs_iso
+    only_cpp   = pairs_cpp - pairs_iso
+    only_py    = pairs_iso - pairs_cpp
+    print(f"  Identical pairs  : {len(identical)} / {n_cpp}")
+    print(f"  Only in C++      : {len(only_cpp)}")
+    print(f"  Only in Python   : {len(only_py)}")
+
     # ── Summary ───────────────────────────────────────────────────────────
     sep("Summary")
     print(f"  {'':32s}  {'matches':>7}  {'vs C++':>8}")
