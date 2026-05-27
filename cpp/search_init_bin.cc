@@ -178,9 +178,18 @@ static int search_for_initialization(const SimpleFrame& F1, const SimpleFrame& F
 }
 
 // ---- main ------------------------------------------------------------------
+// Usage: ./search_init_bin <image1> <image2> <output_bin>
+//
+// Output binary format:
+//   [N1: int32]  number of frame1 keypoints
+//   [N2: int32]  number of frame2 keypoints
+//   [kps1: N1 x {x,y,size,angle,response:float32, octave:int32}]  = N1 x 24 bytes
+//   [kps2: N2 x {x,y,size,angle,response:float32, octave:int32}]  = N2 x 24 bytes
+//   [M:  int32]  number of matches
+//   [matches: M x {i1, i2}: int32]                                 = M x 8 bytes
 int main(int argc, char** argv) {
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <image1> <image2>\n", argv[0]);
+    if (argc != 4) {
+        fprintf(stderr, "Usage: %s <image1> <image2> <output_bin>\n", argv[0]);
         return 1;
     }
 
@@ -198,12 +207,6 @@ int main(int argc, char** argv) {
     ext(img1, cv::Mat(), kps1, descs1, lapping);
     ext(img2, cv::Mat(), kps2, descs2, lapping);
 
-    printf("Frame1 keypoints: %d\n", (int)kps1.size());
-    printf("Frame2 keypoints: %d\n", (int)kps2.size());
-    printf("Level-0 in Frame1: %d\n",
-           (int)std::count_if(kps1.begin(), kps1.end(),
-                              [](const cv::KeyPoint& k){ return k.octave==0; }));
-
     SimpleFrame F1(kps1, descs1, img1.cols, img1.rows);
     SimpleFrame F2(kps2, descs2, img2.cols, img2.rows);
 
@@ -213,7 +216,32 @@ int main(int argc, char** argv) {
     std::vector<int> matches12;
     int nmatches = search_for_initialization(F1, F2, prev_matched, matches12);
 
-    printf("Matches: %d\n", nmatches);
+    // Write binary output
+    FILE* fp = fopen(argv[3], "wb");
+    if (!fp) { fprintf(stderr, "Cannot open output: %s\n", argv[3]); return 1; }
 
+    auto write_kps = [&](const std::vector<cv::KeyPoint>& kps) {
+        int32_t n = (int32_t)kps.size();
+        fwrite(&n, sizeof(int32_t), 1, fp);
+        for (auto& kp : kps) {
+            float fields[5] = {kp.pt.x, kp.pt.y, kp.size, kp.angle, kp.response};
+            int32_t oct = kp.octave;
+            fwrite(fields, sizeof(float), 5, fp);
+            fwrite(&oct,   sizeof(int32_t), 1, fp);
+        }
+    };
+    write_kps(kps1);
+    write_kps(kps2);
+
+    int32_t M = nmatches;
+    fwrite(&M, sizeof(int32_t), 1, fp);
+    for (int i1 = 0; i1 < (int)matches12.size(); i1++) {
+        if (matches12[i1] < 0) continue;
+        int32_t pair[2] = {i1, matches12[i1]};
+        fwrite(pair, sizeof(int32_t), 2, fp);
+    }
+    fclose(fp);
+
+    fprintf(stdout, "Matches: %d\n", nmatches);
     return 0;
 }
