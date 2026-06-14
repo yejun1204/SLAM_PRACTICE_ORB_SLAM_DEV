@@ -13,10 +13,8 @@ Pipeline:
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 
-# ── Camera intrinsics (EuRoC cam0) ─────────────────────────────────────────
-K = np.array([[458.654,   0.0,   367.215],
-              [  0.0,   457.296, 248.375],
-              [  0.0,     0.0,     1.0  ]], dtype=np.float32)
+# ── Camera intrinsics (EuRoC cam0, scaled for 600×350) ──────────────────────
+from src.camera import K
 
 # ── Constants ───────────────────────────────────────────────────────────────
 SIGMA       = 1.0

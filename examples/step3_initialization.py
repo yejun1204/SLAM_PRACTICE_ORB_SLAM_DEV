@@ -14,7 +14,8 @@ import cv2
 import numpy as np
 from src.orb_extractor import ORBExtractor
 from src.orb_matcher  import Frame, search_for_initialization
-from src.initializer  import reconstruct, K
+from src.initializer  import reconstruct
+from src.camera       import resize_image, undistort_keypoints
 
 DATA = os.path.join(os.path.dirname(__file__),
                     '../data/V1_01_easy/mav0/cam0/data')
@@ -24,9 +25,11 @@ MAX_FRAMES = 500
 
 def extract(path):
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-    ext = ORBExtractor(n_features=1000, scale_factor=1.2, n_levels=8,
+    img = resize_image(img)
+    ext = ORBExtractor(n_features=5000, scale_factor=1.2, n_levels=8,
                        ini_th_fast=20, min_th_fast=7)
     kps, descs = ext.detect_and_compute(img)
+    kps = undistort_keypoints(kps)
     return img, kps, descs
 
 
@@ -58,6 +61,7 @@ def main():
         matches12, n_matches = search_for_initialization(
             f1, f2, prev, window_size=100, nn_ratio=0.9, check_orientation=True)
 
+        print(f"  [{cur_idx:4d}] nmatches={n_matches}")
         if n_matches < 100:
             # Reset reference frame (ORB-SLAM3 behaviour)
             ref_idx = cur_idx
@@ -70,7 +74,7 @@ def main():
         pts_cur = np.array([kp.pt for kp in kps_cur], dtype=np.float32)
 
         ok, R, t, points3d, triangulated = reconstruct(
-            pts_ref, pts_cur, matches12, K=K)
+            pts_ref, pts_cur, matches12)
 
         if ok:
             n_tri = int(triangulated.sum())

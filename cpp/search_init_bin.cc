@@ -14,6 +14,22 @@
 #include <opencv2/highgui/highgui.hpp>
 #include "ORBextractor.h"
 
+// ---- Camera parameters (EuRoC cam0, scaled to 600x350) --------------------
+static const int NEW_W = 600, NEW_H = 350;
+static const double SX = NEW_W / 752.0, SY = NEW_H / 480.0;
+static const cv::Matx33d CAM_K(458.654*SX, 0, 367.215*SX,
+                                0, 457.296*SY, 248.375*SY,
+                                0, 0, 1);
+static const cv::Vec4d DIST_COEF(-0.28340811, 0.07395907, 0.00019359, 1.76187114e-05);
+
+static void undistort_kps(std::vector<cv::KeyPoint>& kps) {
+    std::vector<cv::Point2f> pts;
+    pts.reserve(kps.size());
+    for (auto& kp : kps) pts.push_back(kp.pt);
+    cv::undistortPoints(pts, pts, cv::Mat(CAM_K), cv::Mat(DIST_COEF), cv::Mat(), cv::Mat(CAM_K));
+    for (size_t i = 0; i < kps.size(); i++) kps[i].pt = pts[i];
+}
+
 // ---- Constants (ORBmatcher) ------------------------------------------------
 static const int TH_LOW       = 50;
 static const int HISTO_LENGTH = 30;
@@ -199,13 +215,19 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Cannot load images\n"); return 1;
     }
 
-    ORB_SLAM3::ORBextractor ext(1000, 1.2f, 8, 20, 7);
+    cv::resize(img1, img1, cv::Size(NEW_W, NEW_H));
+    cv::resize(img2, img2, cv::Size(NEW_W, NEW_H));
+
+    ORB_SLAM3::ORBextractor ext(5000, 1.2f, 8, 20, 7);
 
     std::vector<cv::KeyPoint> kps1, kps2;
     cv::Mat descs1, descs2;
     std::vector<int> lapping = {0, 0};
     ext(img1, cv::Mat(), kps1, descs1, lapping);
     ext(img2, cv::Mat(), kps2, descs2, lapping);
+
+    undistort_kps(kps1);
+    undistort_kps(kps2);
 
     SimpleFrame F1(kps1, descs1, img1.cols, img1.rows);
     SimpleFrame F2(kps2, descs2, img2.cols, img2.rows);

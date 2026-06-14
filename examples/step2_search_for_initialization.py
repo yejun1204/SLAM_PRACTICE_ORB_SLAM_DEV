@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 from src.orb_extractor import ORBExtractor
 from src.orb_matcher import Frame, search_for_initialization
+from src.camera import resize_image, undistort_keypoints
 
 ROOT    = os.path.join(os.path.dirname(__file__), '..')
 BINARY  = os.path.join(ROOT, 'cpp', 'search_init_bin')
@@ -21,25 +22,6 @@ IMAGE2  = os.path.join(DATA, '1403715273762142976.png')
 
 
 # ── C++ helpers ────────────────────────────────────────────────────────────
-
-def run_cpp_extractor(path):
-    """Run C++ ORBextractor binary, return (keypoints, descriptors)."""
-    orb_bin = os.path.join(ROOT, 'cpp', 'orb_extractor_bin')
-    with tempfile.NamedTemporaryFile(suffix='.bin', delete=False) as f:
-        out = f.name
-    try:
-        subprocess.run([orb_bin, path, out], check=True, capture_output=True)
-        with open(out, 'rb') as f:
-            N    = np.frombuffer(f.read(4),      dtype=np.int32)[0]
-            raw  = np.frombuffer(f.read(N * 24), dtype=np.float32).reshape(N, 6)
-            desc = np.frombuffer(f.read(N * 32), dtype=np.uint8).reshape(N, 32)
-        octaves = raw[:, 5].view(np.int32)
-        kps = [cv2.KeyPoint(float(r[0]), float(r[1]), float(r[2]),
-                            float(r[3] % 360), float(r[4]), int(octaves[i]))
-               for i, r in enumerate(raw)]
-        return kps, desc
-    finally:
-        os.unlink(out)
 
 
 def run_cpp_matcher(img1_path, img2_path):
@@ -77,9 +59,11 @@ def run_cpp_matcher(img1_path, img2_path):
 
 def run_python_extractor(path):
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-    ext = ORBExtractor(n_features=1000, scale_factor=1.2, n_levels=8,
+    img = resize_image(img)
+    ext = ORBExtractor(n_features=5000, scale_factor=1.2, n_levels=8,
                        ini_th_fast=20, min_th_fast=7)
     kps, descs = ext.detect_and_compute(img)
+    kps = undistort_keypoints(kps)
     return img, kps, descs
 
 
@@ -133,8 +117,8 @@ def main():
     print(f"Image1: {os.path.basename(IMAGE1)}")
     print(f"Image2: {os.path.basename(IMAGE2)}")
 
-    img1 = cv2.imread(IMAGE1, cv2.IMREAD_GRAYSCALE)
-    img2 = cv2.imread(IMAGE2, cv2.IMREAD_GRAYSCALE)
+    img1 = resize_image(cv2.imread(IMAGE1, cv2.IMREAD_GRAYSCALE))
+    img2 = resize_image(cv2.imread(IMAGE2, cv2.IMREAD_GRAYSCALE))
 
     # ── C++ (extractor + matcher) ─────────────────────────────────────────
     sep("C++ (ORB-SLAM3 binary)")
@@ -155,33 +139,12 @@ def main():
     print(f"  Frame2 keypoints : {len(kps2_py)}")
     print(f"  Matches          : {n_py}")
 
-    # ── Python matcher + C++ keypoints (logic isolation) ──────────────────
-    sep("Python matcher  +  C++ keypoints  (logic isolation)")
-    _, descs1_cpp = run_cpp_extractor(IMAGE1)
-    _, descs2_cpp = run_cpp_extractor(IMAGE2)
-    matches_iso, n_iso = run_python_matcher(kps1_cpp, descs1_cpp,
-                                            kps2_cpp, descs2_cpp, img1.shape)
-    print(f"  Matches          : {n_iso}  "
-          f"({'== C++' if n_iso == n_cpp else f'diff {n_iso - n_cpp:+d} vs C++'})")
-
-    # ── Match pair comparison: C++ vs Python matcher (same C++ keypoints) ────
-    sep("Match pair comparison  (C++ kps, C++ matcher vs Python matcher)")
-    pairs_cpp = {(i, j) for i, j in enumerate(matches_cpp) if j >= 0}
-    pairs_iso = {(i, j) for i, j in enumerate(matches_iso) if j >= 0}
-    identical  = pairs_cpp & pairs_iso
-    only_cpp   = pairs_cpp - pairs_iso
-    only_py    = pairs_iso - pairs_cpp
-    print(f"  Identical pairs  : {len(identical)} / {n_cpp}")
-    print(f"  Only in C++      : {len(only_cpp)}")
-    print(f"  Only in Python   : {len(only_py)}")
-
     # ── Summary ───────────────────────────────────────────────────────────
     sep("Summary")
     print(f"  {'':32s}  {'matches':>7}  {'vs C++':>8}")
     sep()
     print(f"  {'C++ (reference)':32s}  {n_cpp:>7}")
     print(f"  {'Python (own kps)':32s}  {n_py:>7}  {n_py - n_cpp:>+8d}")
-    print(f"  {'Python matcher + C++ kps':32s}  {n_iso:>7}  {n_iso - n_cpp:>+8d}")
 
     # ── Visualization ─────────────────────────────────────────────────────
     sep("Visualization")
@@ -189,9 +152,6 @@ def main():
     save_match_image(img1, img2, kps1_cpp, kps2_cpp, matches_cpp,
                      os.path.join(out_dir, 'init_matches_cpp.png'),
                      f"C++  {n_cpp} matches")
-    save_match_image(img1, img2, kps1_cpp, kps2_cpp, matches_iso,
-                     os.path.join(out_dir, 'init_matches_cpp_kps.png'),
-                     f"Python matcher + C++ kps  {n_iso} matches")
     save_match_image(img1, img2, kps1_py, kps2_py, matches_py,
                      os.path.join(out_dir, 'init_matches_python.png'),
                      f"Python  {n_py} matches")
