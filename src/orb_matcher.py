@@ -16,7 +16,21 @@ FRAME_GRID_ROWS = 48
 
 def hamming_distance(a, b):
     """Compute Hamming distance between two (32,) uint8 descriptors."""
-    return int(np.unpackbits(np.frombuffer(a ^ b, dtype=np.uint8)).sum())
+    v = np.bitwise_xor(a, b).view(np.uint32)          # (8,) uint32
+    v = v - ((v >> 1) & np.uint32(0x55555555))
+    v = (v & np.uint32(0x33333333)) + ((v >> 2) & np.uint32(0x33333333))
+    v = ((v + (v >> 4)) & np.uint32(0x0F0F0F0F))
+    return int(((v * np.uint32(0x01010101)) >> np.uint32(24)).sum())
+
+
+def hamming_distances(d1, d2s):
+    """Batch Hamming distances: d1 (32,) uint8 vs d2s (M, 32) uint8 → (M,) int."""
+    xor = np.bitwise_xor(d1, d2s)                      # (M, 32) uint8
+    v = np.ascontiguousarray(xor).view(np.uint32)       # (M, 8) uint32
+    v = v - ((v >> 1) & np.uint32(0x55555555))
+    v = (v & np.uint32(0x33333333)) + ((v >> 2) & np.uint32(0x33333333))
+    v = ((v + (v >> 4)) & np.uint32(0x0F0F0F0F))
+    return ((v * np.uint32(0x01010101)) >> np.uint32(24)).sum(axis=1)
 
 
 def _compute_three_maxima(histo):
@@ -151,23 +165,24 @@ def search_for_initialization(frame1, frame2,
             continue
 
         d1 = frame1.descriptors[i1]
-        best_dist = float('inf')
-        best_dist2 = float('inf')
-        best_idx2 = -1
+        cand = np.array(candidates, dtype=np.int32)
 
-        for i2 in candidates:
-            d2 = frame2.descriptors[i2]
-            dist = hamming_distance(d1, d2)
+        # Batch Hamming distances via bit-manipulation popcount (same as C++ DescriptorDistance)
+        dists = hamming_distances(d1, frame2.descriptors[cand])
 
-            if matched_dist[i2] <= dist:
-                continue
+        # Apply matched_dist filter (same as per-candidate continue in original)
+        md = np.fromiter((matched_dist[c] for c in cand), dtype=np.float64, count=len(cand))
+        valid_mask = dists < md
+        if not valid_mask.any():
+            continue
 
-            if dist < best_dist:
-                best_dist2 = best_dist
-                best_dist = dist
-                best_idx2 = i2
-            elif dist < best_dist2:
-                best_dist2 = dist
+        vdists = dists[valid_mask]
+        vcand  = cand[valid_mask]
+        order  = np.argsort(vdists)
+
+        best_dist  = int(vdists[order[0]])
+        best_idx2  = int(vcand[order[0]])
+        best_dist2 = int(vdists[order[1]]) if len(order) > 1 else float('inf')
 
         if best_dist > TH_LOW:
             continue
