@@ -30,7 +30,7 @@ extractor = ORBExtractor(n_features=5000, scale_factor=1.2, n_levels=8,
 def extract(path):
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     img = resize_image(img)
-    kps, descs = extractor(img)
+    kps, descs = extractor.detect_and_compute(img)
     kps = undistort_keypoints(kps)
     return img, kps, descs
 
