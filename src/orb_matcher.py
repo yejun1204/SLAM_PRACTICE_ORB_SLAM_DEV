@@ -34,9 +34,6 @@ def hamming_distances(d1, d2s):
 
 
 def _compute_three_maxima(histo):
-    """Return indices of the three largest histogram bins.
-    Bins smaller than 10% of the largest are discarded (-1).
-    """
     sizes = np.array([len(h) for h in histo])
     order = np.argsort(-sizes)
     ind1, ind2, ind3 = order[0], order[1], order[2]
@@ -52,72 +49,54 @@ def _compute_three_maxima(histo):
 
 
 class Frame:
-    """Lightweight frame: keypoints + descriptors + spatial grid."""
+    """Lightweight frame: keypoints + descriptors + precomputed numpy arrays."""
 
     def __init__(self, keypoints, descriptors, img_w, img_h):
-        """
-        keypoints : list of cv2.KeyPoint (level-0 coords, undistorted)
-        descriptors : np.ndarray (N, 32) uint8
-        img_w, img_h : image dimensions (used for grid bounds)
-        """
-        self.keypoints = keypoints
+        self.keypoints   = keypoints
         self.descriptors = descriptors
         self.img_w = img_w
         self.img_h = img_h
 
-        self.min_x = 0.0
-        self.max_x = float(img_w)
-        self.min_y = 0.0
-        self.max_y = float(img_h)
+        # Precompute numpy arrays for fast vectorized access
+        N = len(keypoints)
+        if N > 0:
+            self.kp_pts     = np.array([kp.pt     for kp in keypoints], dtype=np.float32)  # (N,2)
+            self.kp_octaves = np.array([kp.octave for kp in keypoints], dtype=np.int32)    # (N,)
+            self.kp_angles  = np.array([kp.angle  for kp in keypoints], dtype=np.float32)  # (N,)
+        else:
+            self.kp_pts     = np.empty((0, 2), dtype=np.float32)
+            self.kp_octaves = np.empty(0, dtype=np.int32)
+            self.kp_angles  = np.empty(0, dtype=np.float32)
 
-        self._grid_elem_w_inv = FRAME_GRID_COLS / (self.max_x - self.min_x)
-        self._grid_elem_h_inv = FRAME_GRID_ROWS / (self.max_y - self.min_y)
-
-        self._grid = [[[] for _ in range(FRAME_GRID_ROWS)]
-                      for _ in range(FRAME_GRID_COLS)]
-        self._assign_features_to_grid()
-
-    def _pos_in_grid(self, kp):
-        col = round((kp.pt[0] - self.min_x) * self._grid_elem_w_inv)
-        row = round((kp.pt[1] - self.min_y) * self._grid_elem_h_inv)
-        if col < 0 or col >= FRAME_GRID_COLS or row < 0 or row >= FRAME_GRID_ROWS:
-            return None, None
-        return int(col), int(row)
-
-    def _assign_features_to_grid(self):
-        for i, kp in enumerate(self.keypoints):
-            col, row = self._pos_in_grid(kp)
-            if col is not None:
-                self._grid[col][row].append(i)
+        # Level-0 subset for fast window search
+        l0_mask          = self.kp_octaves == 0
+        self.l0_indices  = np.where(l0_mask)[0]        # (M,) original indices
+        self.l0_pts      = self.kp_pts[self.l0_indices] if len(self.l0_indices) else np.empty((0,2), dtype=np.float32)
 
     def get_features_in_area(self, x, y, r, min_level=-1, max_level=-1):
-        """Return indices of keypoints within window [x±r, y±r] at given levels."""
-        min_col = max(0, int(np.floor((x - self.min_x - r) * self._grid_elem_w_inv)))
-        max_col = min(FRAME_GRID_COLS - 1,
-                      int(np.ceil((x - self.min_x + r) * self._grid_elem_w_inv)))
-        min_row = max(0, int(np.floor((y - self.min_y - r) * self._grid_elem_h_inv)))
-        max_row = min(FRAME_GRID_ROWS - 1,
-                      int(np.ceil((y - self.min_y + r) * self._grid_elem_h_inv)))
+        """Return indices of keypoints within window [x±r, y±r] at given levels.
+        Uses precomputed numpy arrays instead of grid iteration.
+        """
+        if min_level <= 0 and (max_level < 0 or max_level == 0):
+            # Level-0 only (common case for SearchForInitialization)
+            if len(self.l0_indices) == 0:
+                return []
+            dx = np.abs(self.l0_pts[:, 0] - x)
+            dy = np.abs(self.l0_pts[:, 1] - y)
+            mask = (dx < r) & (dy < r)
+            return self.l0_indices[mask].tolist()
 
-        if min_col >= FRAME_GRID_COLS or max_col < 0:
-            return []
-        if min_row >= FRAME_GRID_ROWS or max_row < 0:
-            return []
-
-        check_levels = (min_level > 0) or (max_level >= 0)
-        indices = []
-        for col in range(min_col, max_col + 1):
-            for row in range(min_row, max_row + 1):
-                for idx in self._grid[col][row]:
-                    kp = self.keypoints[idx]
-                    if check_levels:
-                        if kp.octave < min_level:
-                            continue
-                        if max_level >= 0 and kp.octave > max_level:
-                            continue
-                    if abs(kp.pt[0] - x) < r and abs(kp.pt[1] - y) < r:
-                        indices.append(idx)
-        return indices
+        # General case: filter by octave range then position
+        pts = self.kp_pts; oct = self.kp_octaves
+        level_ok = np.ones(len(pts), dtype=bool)
+        if min_level > 0:
+            level_ok &= oct >= min_level
+        if max_level >= 0:
+            level_ok &= oct <= max_level
+        dx = np.abs(pts[:, 0] - x)
+        dy = np.abs(pts[:, 1] - y)
+        mask = level_ok & (dx < r) & (dy < r)
+        return np.where(mask)[0].tolist()
 
 
 def search_for_initialization(frame1, frame2,
@@ -147,31 +126,35 @@ def search_for_initialization(frame1, frame2,
     n1 = len(frame1.keypoints)
     n2 = len(frame2.keypoints)
 
-    matches12 = [-1] * n1
-    matches21 = [-1] * n2
-    matched_dist = [float('inf')] * n2
+    matches12    = np.full(n1, -1, dtype=np.int32)
+    matches21    = np.full(n2, -1, dtype=np.int32)
+    matched_dist = np.full(n2, np.inf, dtype=np.float32)
 
     rot_hist = [[] for _ in range(HISTO_LENGTH)]
     factor = 1.0 / HISTO_LENGTH
 
-    for i1, kp1 in enumerate(frame1.keypoints):
-        if kp1.octave > 0:
+    # Precompute prev_matched as numpy array for fast indexing
+    prev_arr = np.array(prev_matched, dtype=np.float32)  # (N1, 2)
+
+    # Iterate only over level-0 frame1 keypoints
+    for i1 in frame1.l0_indices:
+        cx, cy = prev_arr[i1, 0], prev_arr[i1, 1]
+
+        # Window search in frame2 (level-0 only, numpy filter)
+        if len(frame2.l0_indices) == 0:
             continue
-
-        cx, cy = prev_matched[i1]
-        candidates = frame2.get_features_in_area(cx, cy, window_size,
-                                                  kp1.octave, kp1.octave)
-        if not candidates:
+        dx = np.abs(frame2.l0_pts[:, 0] - cx)
+        dy = np.abs(frame2.l0_pts[:, 1] - cy)
+        in_win = (dx < window_size) & (dy < window_size)
+        if not in_win.any():
             continue
+        cand = frame2.l0_indices[in_win]  # (M,) original frame2 indices
 
-        d1 = frame1.descriptors[i1]
-        cand = np.array(candidates, dtype=np.int32)
+        # Batch Hamming distances
+        dists = hamming_distances(frame1.descriptors[i1], frame2.descriptors[cand])
 
-        # Batch Hamming distances via bit-manipulation popcount (same as C++ DescriptorDistance)
-        dists = hamming_distances(d1, frame2.descriptors[cand])
-
-        # Apply matched_dist filter (same as per-candidate continue in original)
-        md = np.fromiter((matched_dist[c] for c in cand), dtype=np.float64, count=len(cand))
+        # Apply matched_dist filter
+        md = matched_dist[cand]
         valid_mask = dists < md
         if not valid_mask.any():
             continue
@@ -186,43 +169,43 @@ def search_for_initialization(frame1, frame2,
 
         if best_dist > TH_LOW:
             continue
-
         if best_dist >= nn_ratio * best_dist2:
             continue
 
-        # Resolve conflicts: if frame2[best_idx2] was already matched
-        if matches21[best_idx2] >= 0:
-            matches12[matches21[best_idx2]] = -1
+        # Resolve conflicts
+        prev_i1 = int(matches21[best_idx2])
+        if prev_i1 >= 0:
+            matches12[prev_i1] = -1
 
-        matches12[i1] = best_idx2
+        matches12[i1]       = best_idx2
         matches21[best_idx2] = i1
         matched_dist[best_idx2] = best_dist
 
         if check_orientation:
-            rot = kp1.angle - frame2.keypoints[best_idx2].angle
+            rot = float(frame1.kp_angles[i1]) - float(frame2.kp_angles[best_idx2])
             if rot < 0.0:
                 rot += 360.0
             bin_idx = round(rot * factor)
             if bin_idx == HISTO_LENGTH:
                 bin_idx = 0
-            rot_hist[bin_idx].append(i1)
+            rot_hist[bin_idx].append(int(i1))
 
     if check_orientation:
         ind1, ind2, ind3 = _compute_three_maxima(rot_hist)
-        valid = {ind1, ind2, ind3} - {-1}
-        n_matches = 0
+        valid_bins = {ind1, ind2, ind3} - {-1}
         for i in range(HISTO_LENGTH):
-            if i not in valid:
+            if i not in valid_bins:
                 for i1 in rot_hist[i]:
                     if matches12[i1] >= 0:
                         matches12[i1] = -1
-        n_matches = sum(1 for m in matches12 if m >= 0)
-    else:
-        n_matches = sum(1 for m in matches12 if m >= 0)
+
+    n_matches = int((matches12 >= 0).sum())
+
+    matches12_list = matches12.tolist()
 
     # Update prev_matched with matched frame2 positions
-    for i1, i2 in enumerate(matches12):
+    for i1, i2 in enumerate(matches12_list):
         if i2 >= 0:
             prev_matched[i1] = frame2.keypoints[i2].pt
 
-    return matches12, n_matches
+    return matches12_list, n_matches
