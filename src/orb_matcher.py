@@ -133,14 +133,11 @@ def search_for_initialization(frame1, frame2,
     rot_hist = [[] for _ in range(HISTO_LENGTH)]
     factor = 1.0 / HISTO_LENGTH
 
-    # Precompute prev_matched as numpy array for fast indexing
     prev_arr = np.array(prev_matched, dtype=np.float32)  # (N1, 2)
 
-    # Iterate only over level-0 frame1 keypoints
     for i1 in frame1.l0_indices:
         cx, cy = prev_arr[i1, 0], prev_arr[i1, 1]
 
-        # Window search in frame2 (level-0 only, numpy filter)
         if len(frame2.l0_indices) == 0:
             continue
         dx = np.abs(frame2.l0_pts[:, 0] - cx)
@@ -148,12 +145,10 @@ def search_for_initialization(frame1, frame2,
         in_win = (dx < window_size) & (dy < window_size)
         if not in_win.any():
             continue
-        cand = frame2.l0_indices[in_win]  # (M,) original frame2 indices
+        cand = frame2.l0_indices[in_win]
 
-        # Batch Hamming distances
         dists = hamming_distances(frame1.descriptors[i1], frame2.descriptors[cand])
 
-        # Apply matched_dist filter
         md = matched_dist[cand]
         valid_mask = dists < md
         if not valid_mask.any():
@@ -172,12 +167,11 @@ def search_for_initialization(frame1, frame2,
         if best_dist >= nn_ratio * best_dist2:
             continue
 
-        # Resolve conflicts
         prev_i1 = int(matches21[best_idx2])
         if prev_i1 >= 0:
             matches12[prev_i1] = -1
 
-        matches12[i1]       = best_idx2
+        matches12[i1]        = best_idx2
         matches21[best_idx2] = i1
         matched_dist[best_idx2] = best_dist
 
@@ -200,10 +194,8 @@ def search_for_initialization(frame1, frame2,
                         matches12[i1] = -1
 
     n_matches = int((matches12 >= 0).sum())
-
     matches12_list = matches12.tolist()
 
-    # Update prev_matched with matched frame2 positions
     for i1, i2 in enumerate(matches12_list):
         if i2 >= 0:
             prev_matched[i1] = frame2.keypoints[i2].pt
