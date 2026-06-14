@@ -1,4 +1,4 @@
-// Usage: ./orb_extractor_bin <image_path> <output_bin_path>
+// Usage: ./orb_extractor_bin <image_path> <output_bin_path> [n_features=1000]
 //
 // Output binary format:
 //   [N: int32]
@@ -13,8 +13,8 @@
 #include "ORBextractor.h"
 
 int main(int argc, char** argv) {
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <image_path> <output_bin>\n", argv[0]);
+    if (argc < 3 || argc > 4) {
+        fprintf(stderr, "Usage: %s <image_path> <output_bin> [n_features=1000]\n", argv[0]);
         return 1;
     }
 
@@ -24,7 +24,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    ORB_SLAM3::ORBextractor extractor(1000, 1.2f, 8, 20, 7);
+    int n_features = (argc == 4) ? atoi(argv[3]) : 1000;
+    ORB_SLAM3::ORBextractor extractor(n_features, 1.2f, 8, 20, 7);
 
     std::vector<cv::KeyPoint> keypoints;
     cv::Mat descriptors;

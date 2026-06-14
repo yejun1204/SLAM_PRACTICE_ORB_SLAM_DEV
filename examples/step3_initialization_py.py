@@ -1,5 +1,6 @@
 """
 Step 3: Two-view initialization — H/F RANSAC → pose + triangulation
+(Python ORBExtractor version)
 
 Simulates ORB-SLAM3 MonocularInitialization:
   - Keep a reference frame fixed while nmatches >= 100
@@ -7,47 +8,30 @@ Simulates ORB-SLAM3 MonocularInitialization:
   - Try H/F reconstruction until parallax is sufficient
 """
 
-import sys, os, subprocess, tempfile
+import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import cv2
 import numpy as np
-from src.orb_matcher  import Frame, search_for_initialization
-from src.initializer  import reconstruct
-from src.camera       import resize_image, undistort_keypoints
+from src.orb_extractor import ORBExtractor
+from src.orb_matcher   import Frame, search_for_initialization
+from src.initializer   import reconstruct
+from src.camera        import resize_image, undistort_keypoints
 
 DATA    = os.path.join(os.path.dirname(__file__),
                        '../data/V1_01_easy/mav0/cam0/data')
 FRAMES  = sorted(os.listdir(DATA))
 MAX_FRAMES = 500
-ORB_BIN = os.path.join(os.path.dirname(__file__), '../cpp/orb_extractor_bin')
+
+extractor = ORBExtractor(n_features=5000, scale_factor=1.2, n_levels=8,
+                         ini_th_fast=20, min_th_fast=7)
 
 
 def extract(path):
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     img = resize_image(img)
-
-    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
-        tmp_img = f.name
-    with tempfile.NamedTemporaryFile(suffix='.bin', delete=False) as f:
-        tmp_out = f.name
-    try:
-        cv2.imwrite(tmp_img, img)
-        subprocess.run([ORB_BIN, tmp_img, tmp_out, '5000'],
-                       check=True, capture_output=True)
-        with open(tmp_out, 'rb') as f:
-            N    = np.frombuffer(f.read(4),       dtype=np.int32)[0]
-            raw  = np.frombuffer(f.read(N * 24),  dtype=np.float32).reshape(N, 6)
-            descs = np.frombuffer(f.read(N * 32), dtype=np.uint8).reshape(N, 32)
-        octaves = raw[:, 5].view(np.int32)
-        kps = [cv2.KeyPoint(float(r[0]), float(r[1]), float(r[2]),
-                            float(r[3] % 360), float(r[4]), int(octaves[i]))
-               for i, r in enumerate(raw)]
-        kps = undistort_keypoints(kps)
-    finally:
-        os.unlink(tmp_img)
-        os.unlink(tmp_out)
-
+    kps, descs = extractor(img)
+    kps = undistort_keypoints(kps)
     return img, kps, descs
 
 
@@ -60,9 +44,8 @@ def sep(title=""):
 
 
 def main():
-    sep("Monocular initialization  (sliding reference frame)")
+    sep("Monocular initialization  (sliding reference frame)  [Python extractor]")
 
-    # Set initial reference frame
     ref_idx = 0
     img_ref, kps_ref, descs_ref = extract(os.path.join(DATA, FRAMES[ref_idx]))
     prev_matched = [kp.pt for kp in kps_ref]
@@ -81,7 +64,6 @@ def main():
 
         print(f"  [{cur_idx:4d}] nmatches={n_matches}")
         if n_matches < 100:
-            # Reset reference frame (ORB-SLAM3 behaviour)
             ref_idx = cur_idx
             img_ref, kps_ref, descs_ref = img_cur, kps_cur, descs_cur
             prev_matched = [kp.pt for kp in kps_ref]
@@ -112,7 +94,6 @@ def main():
         print("  Initialization FAILED within frame limit.")
         return
 
-    # ── Results ──────────────────────────────────────────────────────────────
     sep("Recovered pose  T21: ref → cur")
     R, t = result['R'], result['t']
     print("  R =")
@@ -127,7 +108,6 @@ def main():
     print(f"  Depth  mean={np.mean(depths):.3f}  "
           f"min={np.min(depths):.3f}  max={np.max(depths):.3f}")
 
-    # ── Visualization ─────────────────────────────────────────────────────────
     sep("Saving visualization")
     kps_ref, kps_cur = result['kps_ref'], result['kps_cur']
     matches12 = result['matches12']
@@ -152,7 +132,7 @@ def main():
                 f"tri={result['n_tri']}",
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
 
-    out = os.path.join(os.path.dirname(__file__), 'init_triangulated.png')
+    out = os.path.join(os.path.dirname(__file__), 'init_triangulated_py.png')
     cv2.imwrite(out, vis)
     print(f"  Saved: {out}")
 
