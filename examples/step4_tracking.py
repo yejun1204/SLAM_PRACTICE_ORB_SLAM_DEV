@@ -12,10 +12,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import cv2
 import numpy as np
+import matplotlib.pyplot as plt
 
 from src.orb_matcher import Frame, search_for_initialization
 from src.initializer import reconstruct
-from src.camera      import K, resize_image, undistort_keypoints
+from src.camera      import K, IMG_W, IMG_H, resize_image, undistort_keypoints
 from src.tracker     import MapPoint, track_with_motion_model
 
 DATA    = os.path.join(os.path.dirname(__file__),
@@ -139,6 +140,82 @@ def build_map(init_result):
     return T_cw_ref, T_cw_cur, map_points
 
 
+# ── Visualization helpers ─────────────────────────────────────────────────────
+
+def draw_reprojection(img, map_points, T_cw, inlier_mps):
+    """Overlay projected map points. Green = inlier, Red = projected but unmatched."""
+    vis = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+    R = T_cw[:3, :3]
+    t = T_cw[:3, 3]
+    h, w = img.shape
+    inlier_ids = {id(mp) for mp in inlier_mps.values()}
+
+    for mp in map_points:
+        x3dc = R @ mp.pos.astype(np.float64) + t
+        if x3dc[2] <= 0:
+            continue
+        iz = 1.0 / x3dc[2]
+        u = int(fx * x3dc[0] * iz + cx)
+        v = int(fy * x3dc[1] * iz + cy)
+        if 0 <= u < w and 0 <= v < h:
+            color = (0, 255, 0) if id(mp) in inlier_ids else (0, 0, 200)
+            cv2.circle(vis, (u, v), 3, color, -1)
+
+    return vis
+
+
+def setup_viz():
+    """Create real-time figure: 2D trajectory + 3D camera poses."""
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+    plt.ion()
+    fig = plt.figure(figsize=(13, 6))
+    ax2d = fig.add_subplot(121)
+    ax2d.set_title('Trajectory (x-z)'); ax2d.set_xlabel('x'); ax2d.set_ylabel('z')
+    ax2d.grid(True)
+    ax3d = fig.add_subplot(122, projection='3d')
+    ax3d.set_title('Camera poses (3D)')
+    ax3d.set_xlabel('x'); ax3d.set_ylabel('y'); ax3d.set_zlabel('z')
+    plt.tight_layout()
+    return fig, ax2d, ax3d
+
+
+def update_viz(ax2d, ax3d, trajectory, poses):
+    """Refresh both subplots with latest trajectory and camera poses."""
+    # ── 2D trajectory ────────────────────────────────────────────────────────
+    ax2d.cla()
+    ax2d.set_title('Trajectory (x-z)'); ax2d.set_xlabel('x'); ax2d.set_ylabel('z')
+    ax2d.grid(True)
+    xs = [p[0] for p in trajectory]
+    zs = [p[2] for p in trajectory]
+    ax2d.plot(xs, zs, 'b-', linewidth=1)
+    ax2d.scatter(xs[0],  zs[0],  c='green', s=50, zorder=5)
+    ax2d.scatter(xs[-1], zs[-1], c='red',   s=50, zorder=5)
+    ax2d.set_aspect('equal')
+
+    # ── 3D camera poses with axes ────────────────────────────────────────────
+    ax3d.cla()
+    ax3d.set_title('Camera poses (3D)')
+    ax3d.set_xlabel('x'); ax3d.set_ylabel('y'); ax3d.set_zlabel('z')
+
+    arr = np.array(trajectory)   # (N,3) camera centers in world
+    extent = float(np.max(arr.max(axis=0) - arr.min(axis=0))) if len(arr) > 1 else 1.0
+    axis_len = max(extent * 0.06, 1e-3)
+
+    for C, T_cw in zip(trajectory, poses):
+        R_wc = T_cw[:3, :3].T          # camera-to-world rotation
+        for i, color in enumerate(['r', 'g', 'b']):
+            d = R_wc[:, i] * axis_len   # i-th camera axis in world
+            ax3d.quiver(C[0], C[1], C[2], d[0], d[1], d[2],
+                        color=color, linewidth=0.8)
+
+    ax3d.plot(arr[:, 0], arr[:, 1], arr[:, 2], 'b-', linewidth=0.6, alpha=0.5)
+    ax3d.scatter(*trajectory[-1], c='red', s=30, zorder=5)
+
+    plt.pause(0.001)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -158,14 +235,19 @@ def main():
     print(f"  {'frame':>5}  {'status':<8}  {'inliers':>7}  {'map_pts':>7}")
     sep()
 
-    start_idx = init['cur_idx'] + 1
-    n_success = 0
-    n_fail    = 0
+    start_idx  = init['cur_idx'] + 1
+    n_success  = 0
+    n_fail     = 0
+    trajectory = []
+    poses      = []
+
+    fig, ax2d, ax3d = setup_viz()
+    cv2.namedWindow('Reprojection', cv2.WINDOW_NORMAL)
+    print("  [any key] next frame   [ESC] quit")
 
     for cur_idx in range(start_idx, min(len(FRAMES), MAX_FRAMES)):
-        _, kps_cur, descs_cur = extract(os.path.join(DATA, FRAMES[cur_idx]))
-        h_img, w_img = 350, 600
-        frame = Frame(kps_cur, descs_cur, w_img, h_img)
+        img_cur, kps_cur, descs_cur = extract(os.path.join(DATA, FRAMES[cur_idx]))
+        frame = Frame(kps_cur, descs_cur, IMG_W, IMG_H)
 
         T_cw, n_inliers, inlier_mps = track_with_motion_model(
             frame, map_points, T_cw_last, velocity, K)
@@ -181,17 +263,35 @@ def main():
         n_fail = 0
         n_success += 1
 
-        # Update velocity: V = T_cur * T_last^{-1}
-        velocity = T_cw @ np.linalg.inv(T_cw_last)
+        velocity  = T_cw @ np.linalg.inv(T_cw_last)
         T_cw_last = T_cw
 
-        # Extract translation for display
-        t_vec = T_cw[:3, 3]
-        print(f"  [{cur_idx:4d}]  OK       inliers={n_inliers:4d}  map={len(map_points):4d}  "
-              f"t=[{t_vec[0]:6.3f} {t_vec[1]:6.3f} {t_vec[2]:6.3f}]")
+        R_cw = T_cw[:3, :3]
+        t_cw = T_cw[:3, 3]
+        C    = -R_cw.T @ t_cw          # camera center in world coordinates
+        trajectory.append(C)
+        poses.append(T_cw.copy())
 
+        print(f"  [{cur_idx:4d}]  OK       inliers={n_inliers:4d}  map={len(map_points):4d}  "
+              f"C=[{C[0]:6.3f} {C[1]:6.3f} {C[2]:6.3f}]")
+
+        # Reprojection window
+        vis = draw_reprojection(img_cur, map_points, T_cw, inlier_mps)
+        cv2.putText(vis, f"frame {cur_idx}  inliers {n_inliers}  | any key: next  ESC: quit",
+                    (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1)
+        cv2.imshow('Reprojection', vis)
+
+        # Real-time trajectory + 3D pose plots
+        update_viz(ax2d, ax3d, trajectory, poses)
+
+        if cv2.waitKey(0) & 0xFF == 27:   # ESC
+            break
+
+    cv2.destroyAllWindows()
+    plt.ioff()
     sep()
     print(f"  Tracked {n_success} frames successfully.")
+    plt.show()
 
 
 if __name__ == '__main__':
