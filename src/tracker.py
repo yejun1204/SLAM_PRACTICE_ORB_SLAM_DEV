@@ -3,19 +3,20 @@ Tracking — ORB-SLAM3 Tracking.cc port (monocular).
 
 Implements:
   - MapPoint
-  - search_by_projection  (ORBmatcher::SearchByProjection, Frame×LastFrame)
-  - pose_optimization     (Optimizer::PoseOptimization via iterative solvePnP)
-  - track_with_motion_model
+  - search_by_projection      (ORBmatcher::SearchByProjection)
+  - pose_optimization         (Optimizer::PoseOptimization via GTSAM LM + Huber)
+  - track_with_motion_model   (Tracking::TrackWithMotionModel)
+  - track_local_map           (Tracking::TrackLocalMap → SearchLocalPoints + PoseOptimization)
 """
 
 import numpy as np
-import cv2
+import gtsam
 from src.orb_matcher import Frame, hamming_distances
 
-TH_HIGH      = 100
-SCALE_FACTOR = 1.2
-N_LEVELS     = 8
-SCALE_FACTORS = np.array([SCALE_FACTOR ** i for i in range(N_LEVELS)], dtype=np.float32)
+TH_HIGH       = 100
+SCALE_FACTOR  = 1.2
+N_LEVELS      = 8
+SCALE_FACTORS = np.array([SCALE_FACTOR ** i for i in range(N_LEVELS)], dtype=np.float64)
 
 
 # ── MapPoint ─────────────────────────────────────────────────────────────────
@@ -94,12 +95,36 @@ def search_by_projection(frame, map_points, T_cw, K, th=15):
     return matched_kps
 
 
-# ── PoseOptimization ──────────────────────────────────────────────────────────
+# ── PoseOptimization (GTSAM) ─────────────────────────────────────────────────
+
+_HUBER_DELTA = float(np.sqrt(5.991))
+_CHI2_TH     = 5.991
+_FIX_NOISE   = gtsam.noiseModel.Isotropic.Sigma(3, 1e-6)
+_POSE_KEY    = gtsam.symbol('x', 0)
+
+
+def _T_cw_to_pose3(T_cw):
+    R_cw = T_cw[:3, :3]
+    t_cw = T_cw[:3, 3]
+    return gtsam.Pose3(gtsam.Rot3(R_cw.T), -R_cw.T @ t_cw)
+
+
+def _pose3_to_T_cw(pose):
+    R_wc = pose.rotation().matrix()
+    t_wc = pose.translation()
+    T = np.eye(4)
+    T[:3, :3] = R_wc.T
+    T[:3, 3]  = -R_wc.T @ t_wc
+    return T
+
 
 def pose_optimization(T_cw_init, kps, mp_list, kp_indices, K, n_iter=4):
     """
-    Refine T_cw with 3D-2D correspondences via iterative solvePnP + outlier removal.
-    Mirrors Optimizer::PoseOptimization (g2o SE3 + Huber, approximated with LM).
+    Refine T_cw via GTSAM LM with per-octave Huber noise model.
+    Mirrors Optimizer::PoseOptimization (g2o SE3 + Huber + invSigma2 per octave).
+
+    Iters 0-1: Huber robust kernel (soft outlier down-weighting).
+    Iters 2-3: no robust kernel, hard chi2 outlier removal only.
 
     Args:
         T_cw_init  : (4,4) initial world→camera pose
@@ -107,73 +132,89 @@ def pose_optimization(T_cw_init, kps, mp_list, kp_indices, K, n_iter=4):
         mp_list    : list of MapPoint, same order as kp_indices
         kp_indices : list of int — which keypoints are matched
         K          : (3,3) camera intrinsics
-        n_iter     : number of outlier-removal iterations (default 4)
+        n_iter     : outer iterations (default 4)
 
     Returns:
         T_cw    : (4,4) float64 refined pose
         inliers : (N,) bool array
     """
-    chi2_th = 5.991   # chi2 95% for 2 DOF (reprojection in x,y)
-    Kd      = K.astype(np.float64)
-    fx, fy  = float(Kd[0, 0]), float(Kd[1, 1])
-    cx, cy  = float(Kd[0, 2]), float(Kd[1, 2])
+    Kd     = K.astype(np.float64)
+    fx, fy = float(Kd[0, 0]), float(Kd[1, 1])
+    cx, cy = float(Kd[0, 2]), float(Kd[1, 2])
+    cal    = gtsam.Cal3_S2(fx, fy, 0.0, cx, cy)
 
-    pts3d   = np.array([mp.pos for mp in mp_list],           dtype=np.float64)  # (N,3)
-    pts2d   = np.array([kps[ki].pt for ki in kp_indices],    dtype=np.float64)  # (N,2)
+    pts3d  = np.array([mp.pos for mp in mp_list],        dtype=np.float64)  # (N,3)
+    pts2d  = np.array([kps[ki].pt for ki in kp_indices], dtype=np.float64)  # (N,2)
+
+    octaves    = np.clip([kps[ki].octave for ki in kp_indices], 0, N_LEVELS - 1)
+    sigmas     = SCALE_FACTORS[np.array(octaves, dtype=np.int32)]   # (N,) sigma per point
+    inv_sigma2 = 1.0 / sigmas ** 2
+
+    # Pre-build per-octave noise models
+    lm_params = gtsam.LevenbergMarquardtParams()
+    lm_params.setMaxIterations(10)
+    lm_params.setVerbosity('SILENT')
 
     T       = T_cw_init.astype(np.float64).copy()
     inliers = np.ones(len(pts3d), dtype=bool)
 
-    for _ in range(n_iter):
-        n_in = int(inliers.sum())
-        if n_in < 4:
+    for it in range(n_iter):
+        active = np.where(inliers)[0]
+        if len(active) < 4:
             break
 
-        rvec_init = cv2.Rodrigues(T[:3, :3])[0]
-        tvec_init = T[:3, 3].reshape(3, 1)
+        graph  = gtsam.NonlinearFactorGraph()
+        values = gtsam.Values()
+        values.insert(_POSE_KEY, _T_cw_to_pose3(T))
 
-        ret, rvec, tvec = cv2.solvePnP(
-            pts3d[inliers], pts2d[inliers],
-            Kd, None,
-            rvec_init, tvec_init,
-            useExtrinsicGuess=True,
-            flags=cv2.SOLVEPNP_ITERATIVE
-        )
-        if not ret:
+        for i in active:
+            pk = gtsam.symbol('l', int(i))
+            values.insert(pk, gtsam.Point3(*pts3d[i]))
+
+            base = gtsam.noiseModel.Isotropic.Sigma(2, float(sigmas[i]))
+            if it < 2:
+                noise = gtsam.noiseModel.Robust.Create(
+                    gtsam.noiseModel.mEstimator.Huber.Create(_HUBER_DELTA), base)
+            else:
+                noise = base
+
+            graph.add(gtsam.GenericProjectionFactorCal3_S2(
+                gtsam.Point2(*pts2d[i]), noise, _POSE_KEY, pk, cal))
+            graph.add(gtsam.PriorFactorPoint3(pk, gtsam.Point3(*pts3d[i]), _FIX_NOISE))
+
+        try:
+            result = gtsam.LevenbergMarquardtOptimizer(graph, values, lm_params).optimize()
+            T = _pose3_to_T_cw(result.atPose3(_POSE_KEY))
+        except Exception:
             break
 
-        R_new = cv2.Rodrigues(rvec)[0]
-        t_new = tvec.flatten()
-        T[:3, :3] = R_new
-        T[:3, 3]  = t_new
-
-        # Recompute reprojection errors for all points
-        x3dc  = (R_new @ pts3d.T).T + t_new          # (N,3)
+        # Outlier removal: whitened chi2 > 5.991
+        R_new, t_new = T[:3, :3], T[:3, 3]
+        x3dc  = (R_new @ pts3d.T).T + t_new
         valid = x3dc[:, 2] > 0
         iz    = np.where(valid, 1.0 / (x3dc[:, 2] + 1e-10), 0.0)
         px    = fx * x3dc[:, 0] * iz + cx
         py    = fy * x3dc[:, 1] * iz + cy
         chi2  = (px - pts2d[:, 0]) ** 2 + (py - pts2d[:, 1]) ** 2
-
-        inliers = valid & (chi2 < chi2_th)
+        inliers = valid & (chi2 * inv_sigma2 < _CHI2_TH)
 
     return T, inliers
 
 
 # ── TrackWithMotionModel ──────────────────────────────────────────────────────
 
-def track_with_motion_model(frame, map_points, T_cw_last, velocity, K, th=15):
+def track_with_motion_model(frame, last_frame_mps, T_cw_last, velocity, K, th=15):
     """
     Estimate current pose using constant-velocity prediction + map point projection.
     Mirrors Tracking::TrackWithMotionModel (monocular path).
 
     Args:
-        frame      : Frame (current)
-        map_points : list of MapPoint (from map / last frame)
-        T_cw_last  : (4,4) pose of previous frame
-        velocity   : (4,4) T_cur_last — relative motion estimate
-        K          : (3,3) camera intrinsics
-        th         : projection search radius factor (15)
+        frame         : Frame (current)
+        last_frame_mps: list of MapPoint visible/inlier in previous frame
+        T_cw_last     : (4,4) pose of previous frame
+        velocity      : (4,4) T_cur_last — relative motion estimate
+        K             : (3,3) camera intrinsics
+        th            : projection search radius factor (15)
 
     Returns:
         T_cw      : (4,4) optimized pose, or None if tracking failed
@@ -184,11 +225,11 @@ def track_with_motion_model(frame, map_points, T_cw_last, velocity, K, th=15):
     T_cw_pred = velocity @ T_cw_last
 
     # 2. SearchByProjection with th=15
-    matches = search_by_projection(frame, map_points, T_cw_pred, K, th)
+    matches = search_by_projection(frame, last_frame_mps, T_cw_pred, K, th)
 
     # 3. Retry with wider window if too few matches
     if len(matches) < 20:
-        matches = search_by_projection(frame, map_points, T_cw_pred, K, 2 * th)
+        matches = search_by_projection(frame, last_frame_mps, T_cw_pred, K, 2 * th)
 
     if len(matches) < 20:
         return None, len(matches), {}
@@ -208,3 +249,49 @@ def track_with_motion_model(frame, map_points, T_cw_last, velocity, K, th=15):
         return None, n_inliers, {}
 
     return T_cw, n_inliers, inlier_mps
+
+
+# ── TrackLocalMap ─────────────────────────────────────────────────────────────
+
+def track_local_map(frame, all_map_points, T_cw, existing_matches, K, th=1):
+    """
+    Project remaining local map points with tight window, then re-optimize pose.
+    Mirrors Tracking::TrackLocalMap → SearchLocalPoints() + PoseOptimization().
+
+    Args:
+        frame            : Frame (current)
+        all_map_points   : all available map points (local map)
+        T_cw             : pose estimate from TrackWithMotionModel
+        existing_matches : dict {kp_idx: MapPoint} already found by TrackWithMotionModel
+        K                : (3,3) camera intrinsics
+        th               : search radius factor (1 for monocular without IMU)
+
+    Returns:
+        T_cw      : (4,4) refined pose
+        n_inliers : int
+        inlier_mps: dict {kp_idx: MapPoint} (existing + new inliers)
+    """
+    matched_kp_set = set(existing_matches.keys())
+    matched_mp_set = set(id(mp) for mp in existing_matches.values())
+
+    # Project map points not already matched, with tight search window
+    remaining  = [mp for mp in all_map_points if id(mp) not in matched_mp_set]
+    new_matches = search_by_projection(frame, remaining, T_cw, K, th=th)
+    new_matches = {ki: mp for ki, mp in new_matches.items()
+                   if ki not in matched_kp_set}
+
+    # Combine existing + new matches
+    combined   = {**existing_matches, **new_matches}
+    kp_indices = list(combined.keys())
+    mp_list    = [combined[ki] for ki in kp_indices]
+
+    if len(kp_indices) < 4:
+        return T_cw, len(kp_indices), existing_matches
+
+    T_cw_new, inliers = pose_optimization(T_cw, frame.keypoints, mp_list, kp_indices, K)
+
+    n_inliers  = int(inliers.sum())
+    inlier_mps = {kp_indices[i]: mp_list[i]
+                  for i in range(len(kp_indices)) if inliers[i]}
+
+    return T_cw_new, n_inliers, inlier_mps
