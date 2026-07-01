@@ -11,6 +11,7 @@ Pipeline:
 """
 
 import numpy as np
+import gtsam
 from concurrent.futures import ThreadPoolExecutor
 
 from src.camera import K
@@ -327,6 +328,122 @@ def _reconstruct_h(inliers, H21, K, kps1, kps2, matches, min_parallax, min_tri):
         return False, None, None, None
 
     return True, Rs[best_idx], ts[best_idx], best_p3d
+
+
+# ── Global Bundle Adjustment ─────────────────────────────────────────────────
+
+_BA_SCALE_FACTORS = np.array([1.2 ** i for i in range(8)], dtype=np.float64)
+_BA_HUBER_DELTA   = float(np.sqrt(5.99))   # thHuber2D in ORB-SLAM3 BundleAdjustment
+
+
+def global_ba(R, t, points3d, tri, matches12, kps_ref, kps_cur, K=K, n_iter=20):
+    """
+    2-frame Bundle Adjustment mirroring Optimizer::GlobalBundleAdjustment (bRobust=True).
+    Ref pose is fixed at identity; cur pose + all 3D points are jointly optimized.
+    Returns refined (R, t, points3d).
+    """
+    Kd     = K.astype(np.float64)
+    fx, fy = float(Kd[0, 0]), float(Kd[1, 1])
+    cx, cy = float(Kd[0, 2]), float(Kd[1, 2])
+    cal    = gtsam.Cal3_S2(fx, fy, 0.0, cx, cy)
+
+    REF_KEY = gtsam.symbol('x', 0)
+    CUR_KEY = gtsam.symbol('x', 1)
+
+    def make_pose3(R_cw, t_cw):
+        R_wc = R_cw.T
+        return gtsam.Pose3(gtsam.Rot3(R_wc), -R_cw.T @ t_cw)
+
+    def pose3_to_Rt(pose):
+        R_wc = pose.rotation().matrix()
+        t_wc = pose.translation()
+        R_cw = R_wc.T
+        return R_cw, -R_cw @ t_wc
+
+    graph  = gtsam.NonlinearFactorGraph()
+    values = gtsam.Values()
+
+    # Ref pose fixed at identity
+    ref_pose = make_pose3(np.eye(3), np.zeros(3))
+    values.insert(REF_KEY, ref_pose)
+    graph.add(gtsam.PriorFactorPose3(
+        REF_KEY, ref_pose, gtsam.noiseModel.Isotropic.Sigma(6, 1e-6)))
+
+    # Cur pose initialized from reconstruction
+    values.insert(CUR_KEY, make_pose3(R.astype(np.float64), t.astype(np.float64)))
+
+    n_points = 0
+    for i, (p3d, is_tri) in enumerate(zip(points3d, tri)):
+        if not is_tri or p3d is None:
+            continue
+        j = int(matches12[i])
+        if j < 0:
+            continue
+
+        pk = gtsam.symbol('l', i)
+        values.insert(pk, gtsam.Point3(*p3d.astype(np.float64)))
+
+        # Ref observation
+        oct_r  = int(np.clip(kps_ref[i].octave, 0, 7))
+        noise_r = gtsam.noiseModel.Robust.Create(
+            gtsam.noiseModel.mEstimator.Huber.Create(_BA_HUBER_DELTA),
+            gtsam.noiseModel.Isotropic.Sigma(2, float(_BA_SCALE_FACTORS[oct_r])))
+        graph.add(gtsam.GenericProjectionFactorCal3_S2(
+            gtsam.Point2(*kps_ref[i].pt), noise_r, REF_KEY, pk, cal))
+
+        # Cur observation
+        oct_c  = int(np.clip(kps_cur[j].octave, 0, 7))
+        noise_c = gtsam.noiseModel.Robust.Create(
+            gtsam.noiseModel.mEstimator.Huber.Create(_BA_HUBER_DELTA),
+            gtsam.noiseModel.Isotropic.Sigma(2, float(_BA_SCALE_FACTORS[oct_c])))
+        graph.add(gtsam.GenericProjectionFactorCal3_S2(
+            gtsam.Point2(*kps_cur[j].pt), noise_c, CUR_KEY, pk, cal))
+
+        n_points += 1
+
+    if n_points < 4:
+        return R, t, points3d
+
+    params = gtsam.LevenbergMarquardtParams()
+    params.setMaxIterations(n_iter)
+    params.setVerbosity('SILENT')
+
+    try:
+        result = gtsam.LevenbergMarquardtOptimizer(graph, values, params).optimize()
+    except Exception:
+        return R, t, points3d
+
+    R_new, t_new = pose3_to_Rt(result.atPose3(CUR_KEY))
+
+    points3d_new = list(points3d)
+    for i, (p3d, is_tri) in enumerate(zip(points3d, tri)):
+        if not is_tri or p3d is None or matches12[i] < 0:
+            continue
+        try:
+            points3d_new[i] = np.array(result.atPoint3(gtsam.symbol('l', i)),
+                                        dtype=np.float32)
+        except Exception:
+            pass
+
+    return R_new, t_new, points3d_new
+
+
+# ── Scale normalization ───────────────────────────────────────────────────────
+
+def normalize_scale(t, points3d, tri):
+    """
+    Scale t and 3D points so that median depth from camera 1 = 1.
+    Mirrors CreateInitialMapMonocular(): scale = 1/medianDepth applied to t and map points.
+    Camera 1 is at the world origin, so depth of a point = its z coordinate.
+    """
+    depths = [points3d[i][2] for i in range(len(points3d))
+              if tri[i] and points3d[i] is not None and points3d[i][2] > 0]
+    if not depths:
+        return t, points3d
+    inv_depth = 1.0 / float(np.median(depths))
+    t_scaled  = t * inv_depth
+    p3d_scaled = [p * inv_depth if p is not None else None for p in points3d]
+    return t_scaled, p3d_scaled
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
