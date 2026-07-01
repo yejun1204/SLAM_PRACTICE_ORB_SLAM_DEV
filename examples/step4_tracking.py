@@ -15,7 +15,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from src.orb_matcher import Frame, search_for_initialization
-from src.initializer import reconstruct
+from src.initializer import reconstruct, global_ba, normalize_scale
 from src.camera      import K, IMG_W, IMG_H, resize_image, undistort_keypoints
 from src.tracker     import MapPoint, track_with_motion_model
 
@@ -117,6 +117,14 @@ def build_map(init_result):
     points3d  = init_result['points3d']
     tri       = init_result['triangulated']
 
+    # GlobalBA: jointly refine cur pose + 3D points (mirrors CreateInitialMapMonocular)
+    kps_ref = init_result['kps_ref']
+    kps_cur_all = init_result['kps_cur']
+    R, t, points3d = global_ba(R, t, points3d, tri, matches12, kps_ref, kps_cur_all)
+
+    # Scale normalization: median depth = 1
+    t, points3d = normalize_scale(t, points3d, tri)
+
     # T_cw for initialization frames
     T_cw_ref = np.eye(4, dtype=np.float64)
     T_cw_cur = np.eye(4, dtype=np.float64)
@@ -213,6 +221,13 @@ def update_viz(ax2d, ax3d, trajectory, poses):
     ax3d.plot(arr[:, 0], arr[:, 1], arr[:, 2], 'b-', linewidth=0.6, alpha=0.5)
     ax3d.scatter(*trajectory[-1], c='red', s=30, zorder=5)
 
+    # Equal axis scale for 3D
+    mid = (arr.max(axis=0) + arr.min(axis=0)) / 2.0
+    half = max(float(np.max(arr.max(axis=0) - arr.min(axis=0))) / 2.0, 1e-3)
+    ax3d.set_xlim(mid[0] - half, mid[0] + half)
+    ax3d.set_ylim(mid[1] - half, mid[1] + half)
+    ax3d.set_zlim(mid[2] - half, mid[2] + half)
+
     plt.pause(0.001)
 
 
@@ -249,6 +264,10 @@ def main():
         img_cur, kps_cur, descs_cur = extract(os.path.join(DATA, FRAMES[cur_idx]))
         frame = Frame(kps_cur, descs_cur, IMG_W, IMG_H)
 
+        # 전체 map_points를 매 프레임 투영한다. 이전 프레임에서 아웃라이어였던
+        # 포인트도 이번 프레임에서 다시 후보가 되므로 inlier 수가 반등할 수 있다.
+        # step5/6은 직전 프레임 LM 인라이어(last_frame_mps)만 사용하기 때문에
+        # 한번 탈락한 포인트는 후보에서 완전히 빠져 단조 감소 경향을 보인다.
         T_cw, n_inliers, inlier_mps = track_with_motion_model(
             frame, map_points, T_cw_last, velocity, K)
 
